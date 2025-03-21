@@ -5,8 +5,6 @@ from typing import Tuple
 import matplotlib.pyplot as plt
 from ..configs import BaseConfig
 
-
-
 class RotaryPositionEmbedding(nn.Module):
     """
     A Flax module that applies partial Rotary Position Embeddings (RoPE) to

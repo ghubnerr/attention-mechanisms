@@ -1,4 +1,4 @@
-from attention_mechanisms.gqa.gqa import GQAAttention
+from attention_mechanisms.mha.mha import SoftmaxAttention
 from attention_mechanisms.configs.minimax_config import MiniMaxConfig
 import jax.numpy as jnp
 import jax
@@ -13,7 +13,7 @@ def test_mha():
         rope_base_freq=10000.0
     )
 
-    attention = GQAAttention(config=config)
+    attention = SoftmaxAttention(config=config)
     
     rng = jax.random.PRNGKey(0)
     batch, seq_len, hidden_size = 2, 10, 6144

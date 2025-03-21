@@ -7,7 +7,7 @@ from ..configs import BaseConfig
 from ..utils.rope import RotaryPositionEmbedding
 from ..utils import xavier_uniform
 
-class SoftmaxAttention(nn.Module):
+class GQAAttention(nn.Module):
     """
     Implements standard scaled dot-product attention with an optional
     Grouped Query Attention (GQA) mechanism using repeated keys and values.
