@@ -1,7 +1,8 @@
 from dataclasses import dataclass
+from .base import BaseConfig
 
 @dataclass
-class MiniMaxConfig:
+class MiniMaxConfig(BaseConfig):
     # MoE
     ffw_hidden_size: int = 9216
     num_experts: int = 32
