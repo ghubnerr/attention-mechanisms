@@ -61,15 +61,15 @@ def test_autoregmla():
 
     params = attention.init(rng, dummy_inputs[:, :1, :])
 
-    cached_c_KV, cached_k_R = None, None
+    cached_cKV, cached_kR = None, None
 
     for i in range(seq_len):
         current_input = dummy_inputs[:, i:i+1, :]
-        output, cached_c_KV, cached_k_R = attention.apply(params, current_input, cached_c_KV=cached_c_KV, cached_k_R=cached_k_R)
+        output, cached_cKV, cached_kR = attention.apply(params, current_input, cached_cKV=cached_cKV, cached_kR=cached_kR)
 
         print(f"Output shape at step {i}: {output.shape}")
-        print(f"Cached c_KV shape at step {i}: {cached_c_KV.shape}")
-        print(f"Cached k_R shape at step {i}: {cached_k_R.shape}")
+        print(f"Cached c_KV shape at step {i}: {cached_cKV.shape}")
+        print(f"Cached k_R shape at step {i}: {cached_kR.shape}")
     
 if __name__ == "__main__":
     test_mla()

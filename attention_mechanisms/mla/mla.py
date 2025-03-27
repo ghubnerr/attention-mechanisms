@@ -33,45 +33,45 @@ class MLAttention(nn.Module):
         Creates projection layers for compressed queries, keys, and values, along with output layers.
         Also initializes rotary positional embedding components.
         """
-        self.num_heads = self.config.num_heads
-        self.head_dim = self.config.head_dim
-        self.hidden_size = self.config.hidden_size
-        self.compressed_dim_kv = self.config.compressed_dim_kv
-        self.compressed_dim_q = self.config.compressed_dim_q
-        self.rope_head_dim = self.config.rope_head_dim
+        self.config.num_heads = self.config.num_heads
+        self.config.head_dim = self.config.head_dim
+        self.config.hidden_size = self.config.hidden_size
+        self.config.compressed_dim_kv = self.config.compressed_dim_kv
+        self.config.compressed_dim_q = self.config.compressed_dim_q
+        self.config.rope_head_dim = self.config.rope_head_dim
         self.rope = RotaryPositionEmbedding(config=self.config)
-        self.scale = 1.0 / jnp.sqrt(self.head_dim + self.rope_head_dim)
+        self.scale = 1.0 / jnp.sqrt(self.config.head_dim + self.config.rope_head_dim)
 
         # W_DKV: (compressed_dim_kv, hidden_size)
-        self.W_DKV = nn.Dense(self.compressed_dim_kv, use_bias=False,
+        self.W_DKV = nn.Dense(self.config.compressed_dim_kv, use_bias=False,
                               kernel_init=xavier_uniform, name="W_DKV")
 
         # W_UK:  (num_heads*head_dim, compressed_dim_kv)
-        self.W_UK = nn.Dense(self.head_dim * self.num_heads, use_bias=False,
+        self.W_UK = nn.Dense(self.config.head_dim * self.config.num_heads, use_bias=False,
                               kernel_init=xavier_uniform, name="W_UK")
 
         # W_UV:  (num_heads*head_dim, compressed_dim_kv)
-        self.W_UV = nn.Dense(self.head_dim * self.num_heads, use_bias=False,
+        self.W_UV = nn.Dense(self.config.head_dim * self.config.num_heads, use_bias=False,
                               kernel_init=xavier_uniform, name="W_UV")
 
         # W_DQ: (compressed_dim_q, seq_len)
-        self.W_DQ = nn.Dense(self.compressed_dim_q, use_bias=False,
+        self.W_DQ = nn.Dense(self.config.compressed_dim_q, use_bias=False,
                               kernel_init=xavier_uniform, name="W_DQ")
 
         # W_UQ: (num_heads*head_dim, seq_len)
-        self.W_UQ = nn.Dense(self.head_dim * self.num_heads, use_bias=False,
+        self.W_UQ = nn.Dense(self.config.head_dim * self.config.num_heads, use_bias=False,
                               kernel_init=xavier_uniform, name="W_UQ")
 
         # W_QR: (num_heads * rope_head_dim, compressed_dim_q)
-        self.W_QR = nn.Dense(self.num_heads * self.rope_head_dim, use_bias=False,
+        self.W_QR = nn.Dense(self.config.num_heads * self.config.rope_head_dim, use_bias=False,
                               kernel_init=xavier_uniform, name="W_QR")
 
         # W_KR: (rope_head_dim, seq_len)
-        self.W_KR = nn.Dense(self.rope_head_dim, use_bias=False,
+        self.W_KR = nn.Dense(self.config.rope_head_dim, use_bias=False,
                               kernel_init=xavier_uniform, name="W_KR")
 
         # W_O: (hidden_size, num_heads * head_dim)
-        self.W_O = nn.Dense(self.hidden_size, use_bias=False,
+        self.W_O = nn.Dense(self.config.hidden_size, use_bias=False,
                             kernel_init=xavier_uniform, name="W_O")
 
     def __call__(self,
@@ -94,7 +94,7 @@ class MLAttention(nn.Module):
 
         """
         batch_size, seq_len, hidden_dims = hidden_states.shape
-        assert hidden_dims == self.hidden_size, "Input hidden size does not match config"
+        assert hidden_dims == self.config.hidden_size, "Input hidden size does not match config"
 
         c_KV = self.W_DKV(hidden_states)
         k_C = self.W_UK(c_KV)
@@ -103,19 +103,19 @@ class MLAttention(nn.Module):
         c_Q = self.W_DQ(hidden_states)
         q_C = self.W_UQ(c_Q)
 
-        q_R = self.W_QR(c_Q).reshape(batch_size, seq_len, self.num_heads, self.rope_head_dim)
-        k_R = self.W_KR(hidden_states).reshape(batch_size, seq_len, 1, self.rope_head_dim)
+        q_R = self.W_QR(c_Q).reshape(batch_size, seq_len, self.config.num_heads, self.config.rope_head_dim)
+        k_R = self.W_KR(hidden_states).reshape(batch_size, seq_len, 1, self.config.rope_head_dim)
 
         q_R, k_R = self.rope(q_R, k_R)
-        k_R = jnp.broadcast_to(k_R, (batch_size, seq_len, self.num_heads, self.rope_head_dim))
+        k_R = jnp.broadcast_to(k_R, (batch_size, seq_len, self.config.num_heads, self.config.rope_head_dim))
 
-        q_C = q_C.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k_C = k_C.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        q_C = q_C.reshape(batch_size, seq_len, self.config.num_heads, self.config.head_dim)
+        k_C = k_C.reshape(batch_size, seq_len, self.config.num_heads, self.config.head_dim)
 
         q = jnp.concatenate([q_C, q_R], axis=-1)
         k = jnp.concatenate([k_C, k_R], axis=-1)
 
-        v = v_C.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v_C.reshape(batch_size, seq_len, self.config.num_heads, self.config.head_dim)
 
         q = jnp.transpose(q, (0, 2, 1, 3))
         k = jnp.transpose(k, (0, 2, 1, 3))
@@ -127,7 +127,7 @@ class MLAttention(nn.Module):
         if mask is not None:
             seq_len_total = k.shape[2]
             mask = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len_total))
-            mask = jnp.repeat(mask, self.num_heads, axis=1)
+            mask = jnp.repeat(mask, self.config.num_heads, axis=1)
             attn_scores += mask * -1e9
 
         attn_probs = nn.softmax(attn_scores, axis=-1)
@@ -136,7 +136,7 @@ class MLAttention(nn.Module):
             dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))))
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.config.num_heads * self.config.head_dim)
 
         return self.W_O(attn_output)
 
@@ -146,103 +146,144 @@ class AutoRegMLAttention(nn.Module):
     Implements Incremental Multi-Latent Attention (AutoRegMLA) for autoregressive inference.
     """
     config: BaseConfig
-
-    def setup(self):
-        self.num_heads = self.config.num_heads
-        self.head_dim = self.config.head_dim
-        self.hidden_size = self.config.hidden_size
-        self.compressed_dim_kv = self.config.compressed_dim_kv
-        self.compressed_dim_q = self.config.compressed_dim_q
-        self.rope_head_dim = self.config.rope_head_dim
-        self.scale = 1.0 / jnp.sqrt(self.head_dim + self.rope_head_dim)
-        self.rope = RotaryPositionEmbedding(config=self.config)
-
-        self.W_DKV = nn.Dense(self.compressed_dim_kv, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_DKV")
-
-        self.W_UK = nn.Dense(self.head_dim * self.num_heads, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_UK")
-
-        self.W_UV = nn.Dense(self.head_dim * self.num_heads, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_UV")
-
-        self.W_DQ = nn.Dense(self.compressed_dim_q, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_DQ")
-
-        self.W_UQ = nn.Dense(self.head_dim * self.num_heads, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_UQ")
-
-        self.W_QR = nn.Dense(self.num_heads * self.rope_head_dim, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_QR")
-
-        self.W_KR = nn.Dense(self.rope_head_dim, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_KR")
-
-        self.W_O = nn.Dense(self.hidden_size, use_bias=False,
-                            kernel_init=xavier_uniform, name="W_O")
-
+    
+    @nn.compact
     def __call__(self,
-                 hidden_states: Float[Array, "batch 1 hidden_size"],
-                 mask: Optional[Float[Array, "batch 1 1 total_len"]] = None,
-                 cached_c_KV: Optional[Float[Array, "batch cache_len compressed_dim_kv"]] = None,
-                 cached_k_R: Optional[Float[Array, "batch cache_len rope_head_dim"]] = None
-                ) -> Tuple[Float[Array, "batch 1 hidden_size"],
-                           Float[Array, "batch cache_len+1 compressed_dim_kv"],
-                           Float[Array, "batch cache_len+1 rope_head_dim"]]:
+                 hidden_states: jnp.ndarray,      # (B,1,hidden_size)
+                 mask: jnp.ndarray = None,        # (B,1,1,total_prefix+1) if used
+                 cached_cKV: jnp.ndarray = None,  # (B,prefix_len,compressed_dim_kv)
+                 cached_kR: jnp.ndarray = None    # (B,prefix_len,num_heads,rope_head_dim)
+                ):
+        """
+        Returns:
+          output:         (B,1,hidden_size)
+          new_cached_cKV: (B,prefix_len+1,compressed_dim_kv)
+          new_cached_kR:  (B,prefix_len+1,num_heads,rope_head_dim)
+        """
+        B, seq_len, _ = hidden_states.shape
+        assert seq_len == 1, "Incremental decode expects seq_len=1."
 
-        batch_size, _, hidden_dims = hidden_states.shape
-        assert hidden_dims == self.hidden_size, "Input hidden size does not match config"
+        # === 1) Parameters ===
+        # Down-projections
+        W_DQ  = self.param("W_DQ",  xavier_uniform, 
+                           (self.config.hidden_size, self.config.compressed_dim_q))
+        W_DKV = self.param("W_DKV", xavier_uniform, 
+                           (self.config.hidden_size, self.config.compressed_dim_kv))
 
-        c_KV = self.W_DKV(hidden_states)
-        k_C = self.W_UK(c_KV).reshape(batch_size, 1, self.num_heads, self.head_dim)
-        v_C = self.W_UV(c_KV).reshape(batch_size, 1, self.num_heads, self.head_dim)
+        # Up-proj for Q's compressed -> multi-head "C" dimension
+        W_UQ_C = self.param("W_UQ_C", xavier_uniform,
+                            (self.config.compressed_dim_q, self.config.num_heads, self.config.head_dim))
+        # Up-proj for Q's compressed -> multi-head "R" dimension (rope)
+        W_UQ_R = self.param("W_UQ_R", xavier_uniform,
+                            (self.config.compressed_dim_q, self.config.num_heads, self.config.rope_head_dim))
 
-        c_Q = self.W_DQ(hidden_states)
-        q_C = self.W_UQ(c_Q).reshape(batch_size, 1, self.num_heads, self.head_dim)
+        # Up-proj for K/V's compressed -> multi-head "C"
+        W_UK_C = self.param("W_UK_C", xavier_uniform,
+                            (self.config.compressed_dim_kv, self.config.num_heads, self.config.head_dim))
+        W_UV_C = self.param("W_UV_C", xavier_uniform,
+                            (self.config.compressed_dim_kv, self.config.num_heads, self.config.head_dim))
 
-        q_R = self.W_QR(c_Q).reshape(batch_size, 1, self.num_heads, self.rope_head_dim)
-        k_R = self.W_KR(hidden_states).reshape(batch_size, 1, 1, self.rope_head_dim)
+        # Decoupled rope key
+        W_KR   = self.param("W_KR", xavier_uniform,
+                            (self.config.hidden_size, self.config.num_heads, self.config.rope_head_dim))
 
-        q_R, k_R_current = self.rope(q_R, k_R)
-        k_R_current = jnp.broadcast_to(k_R_current, (batch_size, 1, self.num_heads, self.rope_head_dim))
+        # Final output projection
+        # shape: (num_heads, head_dim, hidden_size)
+        W_O = self.param("W_O", xavier_uniform,
+                         (self.config.num_heads, self.config.head_dim, self.config.hidden_size))
 
-        q = jnp.concatenate([q_C, q_R], axis=-1)
-        k_current = jnp.concatenate([k_C, k_R_current], axis=-1)
+        # === 2) Build compressed Q for the new token: cQ_t ===
+        # shape (B,1,compressed_dim_q)
+        cQ_t = jnp.einsum("bsh,hq->bsq", hidden_states, W_DQ)
 
-        q = jnp.transpose(q, (0, 2, 1, 3))  # (batch, heads, 1, dim)
-        k_current = jnp.transpose(k_current, (0, 2, 1, 3))  # (batch, heads, 1, dim)
-        v_C = jnp.transpose(v_C, (0, 2, 1, 3))  # (batch, heads, 1, head_dim)
+        # === 3) Build q^C_t and q^R_t (split heads) ===
+        # qC_t: (B,1,num_heads,head_dim)
+        qC_t = jnp.einsum("bsq,qnd->bsnd", cQ_t, W_UQ_C)
+        # qR_t: (B,1,num_heads,rope_head_dim)
+        qR_t = jnp.einsum("bsq,qnr->bsnr", cQ_t, W_UQ_R)
 
-        if cached_c_KV is not None and cached_k_R is not None:
-            # Recompute keys and values from cached compressed KV latent
-            cached_k_C = self.W_UK(cached_c_KV).reshape(batch_size, -1, self.num_heads, self.head_dim)
-            cached_v_C = self.W_UV(cached_c_KV).reshape(batch_size, -1, self.num_heads, self.head_dim)
-            cached_k_R_expanded = jnp.broadcast_to(cached_k_R[..., None, :], (batch_size, cached_k_R.shape[1], self.num_heads, self.rope_head_dim))
+        # === 4) Build decoupled rope key kR_t_raw for the new token, then apply RoPE ===
+        # shape -> (B,1,num_heads,rope_head_dim)
+        kR_t_raw = jnp.einsum("bsh,hnr->bsnr", hidden_states, W_KR)
 
-            cached_k = jnp.concatenate([cached_k_C, cached_k_R_expanded], axis=-1)
+        rope = RotaryPositionEmbedding(self.config)  # or pass config
+        qR_t, kR_t = rope(qR_t, kR_t_raw)  # each => (B,1,num_heads,rope_head_dim)
 
-            cached_k = jnp.transpose(cached_k, (0, 2, 1, 3))
-            cached_v_C = jnp.transpose(cached_v_C, (0, 2, 1, 3))
+        # === 5) Compressed KV for new token, shape (B,1,compressed_dim_kv) ===
+        cKV_t = jnp.einsum("bsh,hv->bsv", hidden_states, W_DKV)
 
-            k = jnp.concatenate([cached_k, k_current], axis=2)
-            v = jnp.concatenate([cached_v_C, v_C], axis=2)
+        # === 6) Build k^C_t, v^C_t for *just* the new token (but not prefix) ===
+        # kC_t: (B,1,num_heads,head_dim)
+        kC_t = jnp.einsum("bsv,vnd->bsnd", cKV_t, W_UK_C)
+        vC_t = jnp.einsum("bsv,vnd->bsnd", cKV_t, W_UV_C)
+
+        # === 7) If there's no cache, make empty prefix arrays ===
+        if cached_cKV is None:
+            cKV_prefix = jnp.zeros((B,0,self.config.compressed_dim_kv), hidden_states.dtype)
+            kR_prefix  = jnp.zeros((B,0,self.config.num_heads,self.config.rope_head_dim), hidden_states.dtype)
         else:
-            k, v = k_current, v_C
+            cKV_prefix = cached_cKV
+            kR_prefix  = cached_kR
+        prefix_len = cKV_prefix.shape[1]
 
-        attn_scores = jax.lax.dot_general(q, k,
-            dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1)))) * self.scale
+        # === 8) Compute prefix's kC, shape (B,prefix_len,num_heads,head_dim) ===
+        kC_prefix = jnp.einsum("btv,vnd->btnd", cKV_prefix, W_UK_C)
+
+        # === 9) Dot with qC_t => prefix_scores_C: (B,1,num_heads,prefix_len) ===
+        prefix_scores_C = jnp.einsum("bsnd,btnd->bsnt", qC_t, kC_prefix)
+
+        # === 10) Compute prefix's rope key => (B,prefix_len,num_heads,rope_head_dim) is already cached
+        # We simply do qR_t dot kR_prefix => prefix_scores_R: (B,1,num_heads,prefix_len)
+        prefix_scores_R = jnp.einsum("bsnr,btnr->bsnt", qR_t, kR_prefix)
+
+        # Summation => (B,1,num_heads,prefix_len)
+        prefix_scores = prefix_scores_C + prefix_scores_R
+
+        # === 11) Score for new token => qC_t dot kC_t + qR_t dot kR_t => (B,1,num_heads,1) ===
+        # We do it in two steps (over head_dim, then rope_dim)
+        new_score_C = jnp.einsum("bsnd,bsnd->bsn", qC_t, kC_t)  # (B,1,num_heads)
+        new_score_R = jnp.einsum("bsnr,bsnr->bsn", qR_t, kR_t)  # (B,1,num_heads)
+        new_score   = new_score_C + new_score_R                 # (B,1,num_heads)
+        new_score   = new_score[...,None]                       # => (B,1,num_heads,1)
+
+        # === 12) Concatenate prefix + new => (B,1,num_heads,prefix_len+1) ===
+        attn_scores = jnp.concatenate([prefix_scores, new_score], axis=-1)
+
+        # === 13) Scale + Mask => shape still (B,1,num_heads,prefix_len+1) ===
+        scale_factor = jnp.sqrt(self.config.head_dim + self.config.rope_head_dim).astype(attn_scores.dtype)
+        attn_scores = attn_scores / scale_factor
 
         if mask is not None:
-            attn_scores += mask * -1e9
+            # mask: (B,1,1,prefix_len+1) => broadcast over num_heads dimension
+            attn_scores = attn_scores + mask * -1e9
 
+        # === 14) Softmax => (B,1,num_heads,prefix_len+1) ===
         attn_probs = nn.softmax(attn_scores, axis=-1)
 
-        attn_output = jax.lax.dot_general(attn_probs, v,
-            dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))))
+        # === 15) Multiply prefix's cKV by W_UV_C => vC_prefix => (B,prefix_len,num_heads,head_dim) ===
+        vC_prefix = jnp.einsum("btv,vnd->btnd", cKV_prefix, W_UV_C)
 
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, 1, -1)
+        # Weighted sum over prefix => (B,1,num_heads,head_dim)
+        prefix_value_agg = jnp.einsum("bsnt,btnd->bsnd",
+                                      attn_probs[...,:prefix_len], vC_prefix)
 
-        new_cached_c_KV = jnp.concatenate([cached_c_KV, c_KV], axis=1) if cached_c_KV is not None else c_KV
-        new_cached_k_R = jnp.concatenate([cached_k_R, k_R.squeeze(2)], axis=1) if cached_k_R is not None else k_R.squeeze(2)
+        # === 16) The new token's value => (B,1,num_heads,head_dim) * broadcast prob => same shape
+        new_value_agg = attn_probs[..., -1:].reshape(B,1,self.config.num_heads,1) * vC_t
 
-        return self.W_O(attn_output), new_cached_c_KV, new_cached_k_R
+        # Sum => final attn_out => (B,1,num_heads,head_dim)
+        attn_out = prefix_value_agg + new_value_agg
+
+        # === 17) Output projection => (B,1,hidden_size)
+        # W_O: (num_heads, head_dim, hidden_size)
+        # sum over (num_heads,head_dim)
+        output = jnp.einsum("bsnd,ndh->bsh", attn_out, W_O)
+
+        # === 18) Update cache with new cKV, kR => keep shapes consistent
+        if cached_cKV is not None:
+            new_cached_cKV = jnp.concatenate([cached_cKV, cKV_t], axis=1)       # (B,prefix_len+1,compressed_dim_kv)
+            new_cached_kR  = jnp.concatenate([cached_kR,  kR_t],  axis=1)       # (B,prefix_len+1,num_heads,rope_head_dim)
+        else:
+            new_cached_cKV = cKV_t  # (B,1,compressed_dim_kv)
+            new_cached_kR  = kR_t   # (B,1,num_heads,rope_head_dim)
+
+        return output, new_cached_cKV, new_cached_kR
