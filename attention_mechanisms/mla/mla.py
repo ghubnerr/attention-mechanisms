@@ -145,13 +145,24 @@ class AutoRegMLAttention(nn.Module):
     config: BaseConfig
 
     def setup(self):
-        # -- Pre‐projection weights (same shape as before) --
+        """
+        Initializes the model parameters using Xavier uniform initialization.
+
+        Parameters:
+        - W_DQ: Projects hidden states to a compressed query representation.
+        - W_DKV: Projects hidden states to a compressed key-value representation.
+        - W_UQ_C: Maps compressed queries to contextual queries.
+        - W_UQ_R: Maps compressed queries to RoPE-enhanced queries.
+        - W_KR: Projects hidden states to RoPE-enhanced keys.
+        - W_UK_C: Transforms compressed keys for absorption trick.
+        - W_UV_C: Transforms compressed values for absorption trick.
+        - W_O: Projects final attention output back to hidden size.
+        - rope: Rotary Position Embedding module for positional encoding.
+        """
         self.W_DQ   = self.param("W_DQ",   xavier_uniform,
                                  (self.config.hidden_size, self.config.compressed_dim_q))
         self.W_DKV  = self.param("W_DKV",  xavier_uniform,
                                  (self.config.hidden_size, self.config.compressed_dim_kv))
-
-        # -- Up‐projection weights (same shapes as your original) --
         self.W_UQ_C = self.param("W_UQ_C", xavier_uniform,
                                  (self.config.compressed_dim_q,
                                   self.config.num_heads * self.config.head_dim))
@@ -162,8 +173,6 @@ class AutoRegMLAttention(nn.Module):
                                  (self.config.hidden_size,
                                   self.config.num_heads * self.config.rope_head_dim))
 
-        # -- Instead of storing W_UK_C and W_UV_C as separate final steps,
-        #    we will absorb them into the query and the output projections below. --
         self.W_UK_C = self.param("W_UK_C", xavier_uniform,
                                  (self.config.compressed_dim_kv,
                                   self.config.num_heads * self.config.head_dim))
@@ -171,21 +180,40 @@ class AutoRegMLAttention(nn.Module):
                                  (self.config.compressed_dim_kv,
                                   self.config.num_heads * self.config.head_dim))
 
-        # -- Final output projection, same shape as before. --
         self.W_O    = self.param("W_O", xavier_uniform,
                                  (self.config.num_heads * self.config.head_dim,
                                   self.config.hidden_size))
         self.rope = RotaryPositionEmbedding(self.config)
 
-    def __call__(self, hidden_states, mask=None,
-                 cached_cKV=None,
-                 cached_kR=None):
+    def __call__(self,
+                 hidden_states: Float[Array, "batch seq_len hidden_size"],
+                 mask: Optional[Float[Array, "batch 1 seq_len seq_len"]] = None,
+                 cached_cKV: Optional[Float[Array, "batch prefix_len compressed_dim_kv"]] = None,
+                 cached_kR: Optional[Float[Array, "batch prefix_len num_heads rope_head_dim"]] = None
+                 ) -> tuple[Float[Array, "batch seq_len hidden_size"],
+                            Float[Array, "batch prefix_len compressed_dim_kv"],
+                            Float[Array, "batch prefix_len num_heads rope_head_dim"]]:
         """
-        hidden_states: (B, seq_len=1, hidden_size) at each new token
-        mask:         shape (B, 1, prefix_len+1) or similar
-        cached_cKV:   shape (B, prefix_len, compressed_dim_kv)
-        cached_kR:    shape (B, prefix_len, num_heads*rope_head_dim)
+        Args:
+            hidden_states (Float[Array, "batch seq_len hidden_size"]): Input tensor.
+            mask (Optional[Float[Array, "batch 1 seq_len seq_len"]]): Mask tensor.
+            cached_cKV (Optional[Float[Array, "batch prefix_len compressed_dim_kv"]]): Cached keys/values.
+            cached_kR (Optional[Float[Array, "batch prefix_len num_heads rope_head_dim"]]): Cached keys for RoPE.
+
+        Returns:
+            tuple: A tuple containing the final attention output, updated cached compressed keys/values, and updated cached RoPE-enhanced keys.
+        
+        The implementation performs the following steps:
+        1. Computes compressed query 'cQ_t' by projecting the hidden states via W_DQ.
+        2. Splits the query into 'qC_t' (contextual query) and 'qR_t' (RoPE-enhanced query).
+        3. Computes RoPE-enhanced key 'kR_t' using W_KR.
+        4. Computes compressed keys/values 'cKV_t' using W_DKV.
+        5. Applies absorption trick to avoid repeated transformation of keys/values.
+        6. Combines queries and keys to obtain final attention scores.
+        7. Computes final attention probabilities and produces output.
+        8. Updates caches with new compressed keys/values and RoPE-enhanced keys.
         """
+
         B, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "This implementation handles 1 token per step."
 
