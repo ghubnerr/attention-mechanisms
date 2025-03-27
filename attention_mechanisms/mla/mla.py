@@ -142,148 +142,166 @@ class MLAttention(nn.Module):
 
 
 class AutoRegMLAttention(nn.Module):
-    """
-    Implements Incremental Multi-Latent Attention (AutoRegMLA) for autoregressive inference.
-    """
     config: BaseConfig
-    
-    @nn.compact
-    def __call__(self,
-                 hidden_states: jnp.ndarray,      # (B,1,hidden_size)
-                 mask: jnp.ndarray = None,        # (B,1,1,total_prefix+1) if used
-                 cached_cKV: jnp.ndarray = None,  # (B,prefix_len,compressed_dim_kv)
-                 cached_kR: jnp.ndarray = None    # (B,prefix_len,num_heads,rope_head_dim)
-                ):
+
+    def setup(self):
+        # -- Pre‐projection weights (same shape as before) --
+        self.W_DQ   = self.param("W_DQ",   xavier_uniform,
+                                 (self.config.hidden_size, self.config.compressed_dim_q))
+        self.W_DKV  = self.param("W_DKV",  xavier_uniform,
+                                 (self.config.hidden_size, self.config.compressed_dim_kv))
+
+        # -- Up‐projection weights (same shapes as your original) --
+        self.W_UQ_C = self.param("W_UQ_C", xavier_uniform,
+                                 (self.config.compressed_dim_q,
+                                  self.config.num_heads * self.config.head_dim))
+        self.W_UQ_R = self.param("W_UQ_R", xavier_uniform,
+                                 (self.config.compressed_dim_q,
+                                  self.config.num_heads * self.config.rope_head_dim))
+        self.W_KR   = self.param("W_KR",   xavier_uniform,
+                                 (self.config.hidden_size,
+                                  self.config.num_heads * self.config.rope_head_dim))
+
+        # -- Instead of storing W_UK_C and W_UV_C as separate final steps,
+        #    we will absorb them into the query and the output projections below. --
+        self.W_UK_C = self.param("W_UK_C", xavier_uniform,
+                                 (self.config.compressed_dim_kv,
+                                  self.config.num_heads * self.config.head_dim))
+        self.W_UV_C = self.param("W_UV_C", xavier_uniform,
+                                 (self.config.compressed_dim_kv,
+                                  self.config.num_heads * self.config.head_dim))
+
+        # -- Final output projection, same shape as before. --
+        self.W_O    = self.param("W_O", xavier_uniform,
+                                 (self.config.num_heads * self.config.head_dim,
+                                  self.config.hidden_size))
+        self.rope = RotaryPositionEmbedding(self.config)
+
+    def __call__(self, hidden_states, mask=None,
+                 cached_cKV=None,
+                 cached_kR=None):
         """
-        Returns:
-          output:         (B,1,hidden_size)
-          new_cached_cKV: (B,prefix_len+1,compressed_dim_kv)
-          new_cached_kR:  (B,prefix_len+1,num_heads,rope_head_dim)
+        hidden_states: (B, seq_len=1, hidden_size) at each new token
+        mask:         shape (B, 1, prefix_len+1) or similar
+        cached_cKV:   shape (B, prefix_len, compressed_dim_kv)
+        cached_kR:    shape (B, prefix_len, num_heads*rope_head_dim)
         """
         B, seq_len, _ = hidden_states.shape
-        assert seq_len == 1, "Incremental decode expects seq_len=1."
+        assert seq_len == 1, "This implementation handles 1 token per step."
 
-        # === 1) Parameters ===
-        # Down-projections
-        W_DQ  = self.param("W_DQ",  xavier_uniform, 
-                           (self.config.hidden_size, self.config.compressed_dim_q))
-        W_DKV = self.param("W_DKV", xavier_uniform, 
-                           (self.config.hidden_size, self.config.compressed_dim_kv))
+        # === 1) Compressed query:  cQ_t = W_DQ * h_t  ===
+        cQ_t = jnp.einsum("bsh,hq->bsq", hidden_states, self.W_DQ)
 
-        # Up-proj for Q's compressed -> multi-head "C" dimension
-        W_UQ_C = self.param("W_UQ_C", xavier_uniform,
-                            (self.config.compressed_dim_q, self.config.num_heads, self.config.head_dim))
-        # Up-proj for Q's compressed -> multi-head "R" dimension (rope)
-        W_UQ_R = self.param("W_UQ_R", xavier_uniform,
-                            (self.config.compressed_dim_q, self.config.num_heads, self.config.rope_head_dim))
+        # === 2) Query parts: qC_t and qR_t ===
+        #     qC_t = W_UQ_C * cQ_t
+        #     qR_t = RoPE( W_UQ_R * cQ_t ), etc.
+        qC_t = jnp.einsum("bsq,qc->bsc", cQ_t, self.W_UQ_C)
+        qR_t = jnp.einsum("bsq,qr->bsr", cQ_t, self.W_UQ_R)
 
-        # Up-proj for K/V's compressed -> multi-head "C"
-        W_UK_C = self.param("W_UK_C", xavier_uniform,
-                            (self.config.compressed_dim_kv, self.config.num_heads, self.config.head_dim))
-        W_UV_C = self.param("W_UV_C", xavier_uniform,
-                            (self.config.compressed_dim_kv, self.config.num_heads, self.config.head_dim))
+        # === 3) Key part for RoPE: kR_t ===
+        kR_t = jnp.einsum("bsh,hr->bsr", hidden_states, self.W_KR)
 
-        # Decoupled rope key
-        W_KR   = self.param("W_KR", xavier_uniform,
-                            (self.config.hidden_size, self.config.num_heads, self.config.rope_head_dim))
+        # --- Reshape qR_t and kR_t for RoPE ---
+        B, _, num_heads_rope_head_dim = qR_t.shape  # qR_t is (B, 1, num_heads * rope_head_dim)
+        num_heads = self.config.num_heads
+        rope_head_dim = self.config.rope_head_dim
 
-        # Final output projection
-        # shape: (num_heads, head_dim, hidden_size)
-        W_O = self.param("W_O", xavier_uniform,
-                         (self.config.num_heads, self.config.head_dim, self.config.hidden_size))
+        # Reshape: (B, 1, num_heads, rope_head_dim)
+        qR_t = qR_t.reshape(B, 1, num_heads, rope_head_dim)
+        kR_t = kR_t.reshape(B, 1, num_heads, rope_head_dim)
 
-        # === 2) Build compressed Q for the new token: cQ_t ===
-        # shape (B,1,compressed_dim_q)
-        cQ_t = jnp.einsum("bsh,hq->bsq", hidden_states, W_DQ)
+        # --- Apply RoPE ---
+        qR_t, kR_t = self.rope(qR_t, kR_t)
 
-        # === 3) Build q^C_t and q^R_t (split heads) ===
-        # qC_t: (B,1,num_heads,head_dim)
-        qC_t = jnp.einsum("bsq,qnd->bsnd", cQ_t, W_UQ_C)
-        # qR_t: (B,1,num_heads,rope_head_dim)
-        qR_t = jnp.einsum("bsq,qnr->bsnr", cQ_t, W_UQ_R)
+        # --- Flatten back to original shape ---
+        qR_t = qR_t.reshape(B, 1, num_heads * rope_head_dim)
+        kR_t = kR_t.reshape(B, 1, num_heads * rope_head_dim)
 
-        # === 4) Build decoupled rope key kR_t_raw for the new token, then apply RoPE ===
-        # shape -> (B,1,num_heads,rope_head_dim)
-        kR_t_raw = jnp.einsum("bsh,hnr->bsnr", hidden_states, W_KR)
 
-        rope = RotaryPositionEmbedding(self.config)  # or pass config
-        qR_t, kR_t = rope(qR_t, kR_t_raw)  # each => (B,1,num_heads,rope_head_dim)
+        # === 4) Compressed KV: cKV_t = W_DKV * h_t  ===
+        cKV_t = jnp.einsum("bsh,hv->bsv", hidden_states, self.W_DKV)
 
-        # === 5) Compressed KV for new token, shape (B,1,compressed_dim_kv) ===
-        cKV_t = jnp.einsum("bsh,hv->bsv", hidden_states, W_DKV)
-
-        # === 6) Build k^C_t, v^C_t for *just* the new token (but not prefix) ===
-        # kC_t: (B,1,num_heads,head_dim)
-        kC_t = jnp.einsum("bsv,vnd->bsnd", cKV_t, W_UK_C)
-        vC_t = jnp.einsum("bsv,vnd->bsnd", cKV_t, W_UV_C)
-
-        # === 7) If there's no cache, make empty prefix arrays ===
+        # Prepare empty cache if none
         if cached_cKV is None:
-            cKV_prefix = jnp.zeros((B,0,self.config.compressed_dim_kv), hidden_states.dtype)
-            kR_prefix  = jnp.zeros((B,0,self.config.num_heads,self.config.rope_head_dim), hidden_states.dtype)
+            cached_cKV = jnp.zeros((B, 0, self.config.compressed_dim_kv),
+                                   dtype=hidden_states.dtype)
+            cached_kR  = jnp.zeros((B, 0,
+                                    self.config.num_heads*self.config.rope_head_dim),
+                                   dtype=hidden_states.dtype)
+
+        # ------------------------------------------------------------------
+        # ABSORPTION TRICK:
+        #
+        # Instead of computing
+        #     kC_prefix = cached_cKV @ W_UK_C
+        # each time, we rewrite the dot product as
+        #     (qC_t)ᵀ · (W_UK_C @ cKV_prefix) = (W_UK_Cᵀ @ qC_t)ᵀ · cKV_prefix
+        #
+        # so we only re‐transform the new query by W_UK_Cᵀ.  The same applies
+        # for the new token’s cKV (for keys).  Then for values we fold W_UV_C
+        # into the output projection W_O at the end.
+        # ------------------------------------------------------------------
+
+        # === 5) "Absorbed" query for the compressed keys: qC_eff = qC_t * W_UK_C^T
+        #     shape: (B, 1, compressed_dim_kv)
+        W_UK_C_T = jnp.transpose(self.W_UK_C, (1,0))  # shape (n_heads*head_dim, compressed_dim_kv)
+        qC_eff   = jnp.einsum("bsc,ck->bsk", qC_t, W_UK_C_T)
+        # Now qC_eff can dot with cached_cKV or cKV_t directly.
+
+        # Dot product for prefix
+        if cached_cKV.shape[1] > 0:
+            score_Cprefix = jnp.einsum("bsk,bLk->bsL", qC_eff, cached_cKV)
         else:
-            cKV_prefix = cached_cKV
-            kR_prefix  = cached_kR
-        prefix_len = cKV_prefix.shape[1]
+            score_Cprefix = jnp.zeros((B, 1, 0), dtype=hidden_states.dtype)
 
-        # === 8) Compute prefix's kC, shape (B,prefix_len,num_heads,head_dim) ===
-        kC_prefix = jnp.einsum("btv,vnd->btnd", cKV_prefix, W_UK_C)
+        # Dot product for new token
+        new_token_score_C = jnp.einsum("bsk,bsk->bs", qC_eff, cKV_t)[:, None]
 
-        # === 9) Dot with qC_t => prefix_scores_C: (B,1,num_heads,prefix_len) ===
-        prefix_scores_C = jnp.einsum("bsnd,btnd->bsnt", qC_t, kC_prefix)
+        # === 6) The "R" part: we still do normal qR . kR dot products.
+        #     shape (B,1, prefix_len) and (B,1,1), same as above
+        if cached_kR.shape[1] > 0:
+            score_Rprefix = jnp.einsum("bsr,bLr->bsL", qR_t, cached_kR)
+        else:
+            score_Rprefix = jnp.zeros_like(score_Cprefix)
 
-        # === 10) Compute prefix's rope key => (B,prefix_len,num_heads,rope_head_dim) is already cached
-        # We simply do qR_t dot kR_prefix => prefix_scores_R: (B,1,num_heads,prefix_len)
-        prefix_scores_R = jnp.einsum("bsnr,btnr->bsnt", qR_t, kR_prefix)
+        new_token_score_R = jnp.einsum("bsr,bsr->bs", qR_t, kR_t)[:, None]
 
-        # Summation => (B,1,num_heads,prefix_len)
-        prefix_scores = prefix_scores_C + prefix_scores_R
+        # === 7) Combine prefix & new token for final attention scores  ===
+        prefix_scores = score_Cprefix + score_Rprefix  # shape (B,1,prefix_len)
+        new_token_score = new_token_score_C + new_token_score_R  # shape (B,1)
 
-        # === 11) Score for new token => qC_t dot kC_t + qR_t dot kR_t => (B,1,num_heads,1) ===
-        # We do it in two steps (over head_dim, then rope_dim)
-        new_score_C = jnp.einsum("bsnd,bsnd->bsn", qC_t, kC_t)  # (B,1,num_heads)
-        new_score_R = jnp.einsum("bsnr,bsnr->bsn", qR_t, kR_t)  # (B,1,num_heads)
-        new_score   = new_score_C + new_score_R                 # (B,1,num_heads)
-        new_score   = new_score[...,None]                       # => (B,1,num_heads,1)
-
-        # === 12) Concatenate prefix + new => (B,1,num_heads,prefix_len+1) ===
-        attn_scores = jnp.concatenate([prefix_scores, new_score], axis=-1)
-
-        # === 13) Scale + Mask => shape still (B,1,num_heads,prefix_len+1) ===
-        scale_factor = jnp.sqrt(self.config.head_dim + self.config.rope_head_dim).astype(attn_scores.dtype)
-        attn_scores = attn_scores / scale_factor
-
+        scores = jnp.concatenate([prefix_scores, new_token_score], axis=-1)
+        scores = scores / jnp.sqrt(self.config.head_dim + self.config.rope_head_dim)
         if mask is not None:
-            # mask: (B,1,1,prefix_len+1) => broadcast over num_heads dimension
-            attn_scores = attn_scores + mask * -1e9
+            scores += mask * -1e9
 
-        # === 14) Softmax => (B,1,num_heads,prefix_len+1) ===
-        attn_probs = nn.softmax(attn_scores, axis=-1)
+        attn_probs = nn.softmax(scores, axis=-1)  # shape (B,1, prefix_len+1)
 
-        # === 15) Multiply prefix's cKV by W_UV_C => vC_prefix => (B,prefix_len,num_heads,head_dim) ===
-        vC_prefix = jnp.einsum("btv,vnd->btnd", cKV_prefix, W_UV_C)
+        # === 8) Now absorb W_UV_C into W_O so we do not re‐project cKV.  ===
+        # We define W_VO = W_UV_C @ W_O.
+        #   - W_UV_C : (compressed_dim_kv, n_heads*head_dim)
+        #   - W_O    : (n_heads*head_dim, hidden_size)
+        # => W_VO is shape (compressed_dim_kv, hidden_size)
+        W_VO = jnp.einsum("kv,vc->kc", self.W_UV_C, self.W_O)  # (compressed_dim_kv, hidden_size)
 
-        # Weighted sum over prefix => (B,1,num_heads,head_dim)
-        prefix_value_agg = jnp.einsum("bsnt,btnd->bsnd",
-                                      attn_probs[...,:prefix_len], vC_prefix)
-
-        # === 16) The new token's value => (B,1,num_heads,head_dim) * broadcast prob => same shape
-        new_value_agg = attn_probs[..., -1:].reshape(B,1,self.config.num_heads,1) * vC_t
-
-        # Sum => final attn_out => (B,1,num_heads,head_dim)
-        attn_out = prefix_value_agg + new_value_agg
-
-        # === 17) Output projection => (B,1,hidden_size)
-        # W_O: (num_heads, head_dim, hidden_size)
-        # sum over (num_heads,head_dim)
-        output = jnp.einsum("bsnd,ndh->bsh", attn_out, W_O)
-
-        # === 18) Update cache with new cKV, kR => keep shapes consistent
-        if cached_cKV is not None:
-            new_cached_cKV = jnp.concatenate([cached_cKV, cKV_t], axis=1)       # (B,prefix_len+1,compressed_dim_kv)
-            new_cached_kR  = jnp.concatenate([cached_kR,  kR_t],  axis=1)       # (B,prefix_len+1,num_heads,rope_head_dim)
+        # For the prefix tokens, do: prefix_value = cached_cKV @ W_VO => shape (B, prefix_len, hidden_size)
+        if cached_cKV.shape[1] > 0:
+            prefix_value = jnp.einsum("bLk,kc->bLc", cached_cKV, W_VO)  # (B,prefix_len,hidden_size)
+            prefix_value_agg = jnp.einsum(
+                "bsl,blc->bsc", attn_probs[..., :-1], prefix_value
+            )  # => (B,1,hidden_size)
         else:
-            new_cached_cKV = cKV_t  # (B,1,compressed_dim_kv)
-            new_cached_kR  = kR_t   # (B,1,num_heads,rope_head_dim)
+            prefix_value_agg = 0.0
+
+        # For the newly generated token: new_value = cKV_t @ W_VO => (B,1,hidden_size)
+        new_value = jnp.einsum("bsk,kc->bsc", cKV_t, W_VO)
+        new_value_agg = attn_probs[..., -1:] * new_value  # shape (B,1,hidden_size)
+
+        # Final attention output: (B,1,hidden_size)
+        output = prefix_value_agg + new_value_agg
+
+        # === 9) Append the new cKV & kR to the caches.  ===
+        new_cached_cKV = jnp.concatenate([cached_cKV, cKV_t], axis=1)
+        new_cached_kR  = jnp.concatenate([cached_kR,  kR_t ], axis=1)
 
         return output, new_cached_cKV, new_cached_kR
