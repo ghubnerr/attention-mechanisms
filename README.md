@@ -10,5 +10,5 @@
 - [ ] Dataset
 - [ ] Evals
 - [ ] Separate into flax and torch
-- [ ] Append kernels into modules
+- [ ] Append kernels into modules / or separate module
 - [ ] Package it to PyPi
