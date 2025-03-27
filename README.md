@@ -5,6 +5,10 @@
 - [X] Translate Notebook into Repo
 - [ ] Notebook transformer block
 - [ ] Model sharding -> /sharding branch
+- [ ] Rename module to attention
+- [ ] Make `__init__.py` imports better
 - [ ] Dataset
 - [ ] Evals
-- [ ] Add more...
+- [ ] Separate into flax and torch
+- [ ] Append kernels into modules
+- [ ] Package it to PyPi
