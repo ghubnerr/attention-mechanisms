@@ -2,9 +2,9 @@
 
 ### Tasks:
 
-- [ ] Translate Notebook into Repo
+- [X] Translate Notebook into Repo
 - [ ] Notebook transformer block
-- [ ] Model sharding
+- [ ] Model sharding -> /sharding branch
 - [ ] Dataset
 - [ ] Evals
 - [ ] Add more...
