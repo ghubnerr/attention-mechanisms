@@ -238,11 +238,12 @@ class AutoRegMLAttention(nn.Module):
         Float[Array, "batch prefix_len rope_head_dim"]
     ]:
         """
-        Performs autoregressive MLA with "decoupled RoPE".
+        Performs autoregressive MLA with "decoupled RoPE" while maintaining per-head attention.
         """
         B, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "This implementation is designed for one token per step."
         nH, rH = self.config.num_heads, self.config.rope_head_dim
+        head_dim = self.config.head_dim
 
         if cached_cKV is None:
             cached_cKV = jnp.zeros((B, 0, self.config.compressed_dim_kv), dtype=hidden_states.dtype)
@@ -250,45 +251,89 @@ class AutoRegMLAttention(nn.Module):
             cached_kR = jnp.zeros((B, 0, rH), dtype=hidden_states.dtype)
         prefix_len = cached_cKV.shape[1]
 
+        # Compute compressed representations (same as before)
         cQ_t = jnp.einsum('bsh,hq->bsq', hidden_states, self.W_DQ)
         cKV_t = jnp.einsum('bsh,hv->bsv', hidden_states, self.W_DKV)
 
-        qC_t = jnp.einsum('bsq,qc->bsc', cQ_t, self.W_UQ_C)
+        # Compute per-head queries (contextual and RoPE parts)
+        qC_t = jnp.einsum('bsq,qc->bsc', cQ_t, self.W_UQ_C).reshape(B, seq_len, nH, head_dim)
         qR_t = jnp.einsum('bsq,qr->bsr', cQ_t, self.W_UQ_R).reshape(B, seq_len, nH, rH)
 
+        # Compute RoPE key (same as before)
         kR_t = jnp.einsum('bsh,hr->bsr', hidden_states, self.W_KR).reshape(B, seq_len, 1, rH)
         qR_t, kR_t = self.rope(qR_t, kR_t)
         kR_t_broadcasted = jnp.broadcast_to(kR_t, (B, seq_len, nH, rH))
         
-        qR_t_flat = qR_t.reshape(B, seq_len, nH * rH)
-        kR_t_flat = kR_t_broadcasted.reshape(B, seq_len, nH * rH)
-
+        # Absorption trick: instead of computing k_C = W_UK * cKV for each token,
+        # we compute q_eff = q_C * W_UK^T for the current token
         W_UK_C_T = jnp.transpose(self.W_UK_C, (1, 0))
-        qC_eff = jnp.einsum('bsc,ck->bsk', qC_t, W_UK_C_T)
+        W_UK_C_reshaped = W_UK_C_T.reshape(nH, head_dim, -1)
         
-        score_Cprefix = jnp.einsum('bsk,bLk->bsL', qC_eff, cached_cKV) if prefix_len > 0 else jnp.zeros((B, seq_len, 0), dtype=hidden_states.dtype)
-        new_token_score_C = jnp.einsum('bsk,bsk->bs', qC_eff, cKV_t)[:, :, None]
+        # KEY CHANGE: Maintain per-head structure for scores
+        # Reshape qC_t to (B, seq_len, nH, head_dim) for per-head processing
+        qC_per_head = qC_t
         
+        # Compute effective query per head using the absorption trick
+        qC_eff = jnp.einsum('bsnh,nhk->bsnk', qC_per_head, W_UK_C_reshaped)
+        
+        # Compute scores for prefix tokens (per head)
         if prefix_len > 0:
-            cached_kR_expanded = jnp.repeat(cached_kR, nH, axis=2)
-            score_Rprefix = jnp.einsum('bsr,bLr->bsL', qR_t_flat, cached_kR_expanded)
+            # Compute contextual score component per head
+            score_Cprefix = jnp.einsum('bsnk,bLk->bsnL', qC_eff, cached_cKV)
+            
+            # Compute RoPE score component per head
+            cached_kR_expanded = jnp.repeat(cached_kR, 1, axis=2).reshape(B, prefix_len, 1, rH)
+            cached_kR_broadcasted = jnp.broadcast_to(cached_kR_expanded, (B, prefix_len, nH, rH))
+            score_Rprefix = jnp.einsum('bsnr,bLnr->bsnL', qR_t, cached_kR_broadcasted)
+            
+            # Combine score components
+            score_prefix = score_Cprefix + score_Rprefix
         else:
-            score_Rprefix = jnp.zeros_like(score_Cprefix)
-        new_token_score_R = jnp.einsum('bsr,bsr->bs', qR_t_flat, kR_t_flat)[:, :, None]
-
-        scores = jnp.concatenate([score_Cprefix + score_Rprefix, new_token_score_C + new_token_score_R], axis=-1)
-        scores = scores * (1.0 / jnp.sqrt(self.config.head_dim + rH))
+            score_prefix = jnp.zeros((B, seq_len, nH, 0), dtype=hidden_states.dtype)
+        
+        # Compute score for the new token (per head)
+        new_token_score_C = jnp.einsum('bsnk,bsk->bsn', qC_eff, cKV_t)[..., None]
+        new_token_score_R = jnp.einsum('bsnr,bsnr->bsn', qR_t, kR_t_broadcasted)[..., None]
+        new_token_score = new_token_score_C + new_token_score_R
+        
+        # Concatenate prefix and new token scores
+        scores = jnp.concatenate([score_prefix, new_token_score], axis=-1)
+        
+        # Scale and mask
+        scores = scores * (1.0 / jnp.sqrt(head_dim + rH))
         if mask is not None:
-            scores = scores + mask * -1e9
+            # Expand mask for all heads
+            expanded_mask = jnp.broadcast_to(mask, (B, nH, seq_len, mask.shape[-1]))
+            scores = scores + expanded_mask * -1e9
+        
+        # Apply softmax per head
         attn_probs = nn.softmax(scores, axis=-1)
+        
+        # Value computation with absorption trick
+        # Reshape W_UV_C to per-head format for the absorption trick
+        W_UV_C_reshaped = self.W_UV_C.reshape(-1, nH, head_dim)
+        W_O_reshaped = self.W_O.reshape(nH, head_dim, -1)
 
-        W_VO = jnp.einsum('kv,vc->kc', self.W_UV_C, self.W_O)
-        prefix_agg = jnp.einsum('bsl,blc->bsc', attn_probs[..., :-1], 
-                            jnp.einsum('bLk,kc->bLc', cached_cKV, W_VO)) if prefix_len > 0 else 0.0
-        new_value = jnp.einsum('bsk,kc->bsc', cKV_t, W_VO)
-        output = prefix_agg + attn_probs[..., -1:] * new_value
+        # Compute output with attention probabilities (per head)
+        if prefix_len > 0:
+            # Process prefix context
+            prefix_values = jnp.einsum('bLk,knh->bLnh', cached_cKV, W_UV_C_reshaped)
+            prefix_agg = jnp.einsum('bsnL,bLnh->bsnh', attn_probs[..., :-1], prefix_values)
+        else:
+            prefix_agg = 0.0
 
+        # Process new token
+        new_values = jnp.einsum('bsk,knh->bsnh', cKV_t, W_UV_C_reshaped)
+        new_agg = attn_probs[..., -1:] * new_values
+
+        # Combine aggregated values
+        attn_output = prefix_agg + new_agg
+
+        # Project to output dimension
+        output = jnp.einsum('bsnh,nhc->bsc', attn_output, W_O_reshaped)
+        
+        # Update cache
         new_cached_cKV = jnp.concatenate([cached_cKV, cKV_t], axis=1)
         new_cached_kR = jnp.concatenate([cached_kR, kR_t[:, :, 0, :]], axis=1)
-
+        
         return output, new_cached_cKV, new_cached_kR
