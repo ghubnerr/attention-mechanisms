@@ -1,3 +1,4 @@
+from typing import Optional
 from dataclasses import dataclass
 from .base import BaseConfig
 
@@ -22,3 +23,7 @@ class MiniMaxConfig(BaseConfig):
     # RoPE
     rope_fraction: float = 0.5
     rope_base_freq: float = 10000
+    
+    compressed_dim_kv: Optional[int] = None
+    compressed_dim_q: Optional[int] = None
+    rope_head_dim: Optional[int] = None
