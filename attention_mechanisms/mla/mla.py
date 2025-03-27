@@ -201,7 +201,6 @@ class AutoRegMLAttention(nn.Module):
             (self.config.compressed_dim_q, self.config.num_heads * self.config.rope_head_dim)
         )
 
-        # 3) Single per-token rope key => shape (hidden_size, rope_head_dim)
         self.W_KR   = self.param(
             "W_KR", nn.initializers.xavier_uniform(),
             (self.config.hidden_size, self.config.rope_head_dim)
@@ -217,13 +216,11 @@ class AutoRegMLAttention(nn.Module):
             (self.config.compressed_dim_kv, self.config.num_heads * self.config.head_dim)
         )
 
-        # 5) Final output projection => shape (num_heads*head_dim, hidden_size)
         self.W_O    = self.param(
             "W_O", nn.initializers.xavier_uniform(),
             (self.config.num_heads * self.config.head_dim, self.config.hidden_size)
         )
 
-        # RoPE module for q^R and k^R
         self.rope = RotaryPositionEmbedding(self.config)
 
     def __call__(
@@ -238,7 +235,19 @@ class AutoRegMLAttention(nn.Module):
         Float[Array, "batch prefix_len rope_head_dim"]
     ]:
         """
-        Performs autoregressive MLA with "decoupled RoPE" while maintaining per-head attention.
+        Applies the MLA mechanism to the input hidden states.
+
+        Args:
+            hidden_states (Float[Array, "batch seq_len hidden_size"]):
+                The input tensor of shape (batch_size, seq_len, hidden_size) representing the input sequence.
+
+            mask (Optional[Float[Array, "batch 1 seq_len seq_len"]], optional):
+                Attention mask of shape (batch_size, 1, seq_len, seq_len). If provided, positions with value 1 are masked out.
+
+        Returns:
+            Float[Array, "batch seq_len hidden_size"]:
+                The output tensor of the attention mechanism with the same shape as the input tensor.
+
         """
         B, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "This implementation is designed for one token per step."
@@ -269,14 +278,11 @@ class AutoRegMLAttention(nn.Module):
         W_UK_C_T = jnp.transpose(self.W_UK_C, (1, 0))
         W_UK_C_reshaped = W_UK_C_T.reshape(nH, head_dim, -1)
         
-        # KEY CHANGE: Maintain per-head structure for scores
-        # Reshape qC_t to (B, seq_len, nH, head_dim) for per-head processing
+
         qC_per_head = qC_t
         
-        # Compute effective query per head using the absorption trick
         qC_eff = jnp.einsum('bsnh,nhk->bsnk', qC_per_head, W_UK_C_reshaped)
         
-        # Compute scores for prefix tokens (per head)
         if prefix_len > 0:
             # Compute contextual score component per head
             score_Cprefix = jnp.einsum('bsnk,bLk->bsnL', qC_eff, cached_cKV)
@@ -314,7 +320,6 @@ class AutoRegMLAttention(nn.Module):
         W_UV_C_reshaped = self.W_UV_C.reshape(-1, nH, head_dim)
         W_O_reshaped = self.W_O.reshape(nH, head_dim, -1)
 
-        # Compute output with attention probabilities (per head)
         if prefix_len > 0:
             # Process prefix context
             prefix_values = jnp.einsum('bLk,knh->bLnh', cached_cKV, W_UV_C_reshaped)
@@ -322,17 +327,15 @@ class AutoRegMLAttention(nn.Module):
         else:
             prefix_agg = 0.0
 
-        # Process new token
         new_values = jnp.einsum('bsk,knh->bsnh', cKV_t, W_UV_C_reshaped)
         new_agg = attn_probs[..., -1:] * new_values
 
-        # Combine aggregated values
         attn_output = prefix_agg + new_agg
 
-        # Project to output dimension
+
         output = jnp.einsum('bsnh,nhc->bsc', attn_output, W_O_reshaped)
         
-        # Update cache
+
         new_cached_cKV = jnp.concatenate([cached_cKV, cKV_t], axis=1)
         new_cached_kR = jnp.concatenate([cached_kR, kR_t[:, :, 0, :]], axis=1)
         
