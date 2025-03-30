@@ -19,4 +19,11 @@ class BaseConfig(abc.ABC):
     compressed_dim_kv: Optional[int]
     compressed_dim_q: Optional[int]
     rope_head_dim: Optional[int]
+    
+    # Normalization
+    rms_norm_epsilon: Optional[float]
+    
+    vocab_size: int
+    max_seq_len: int
+
 

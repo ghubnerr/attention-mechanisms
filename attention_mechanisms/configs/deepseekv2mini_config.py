@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from .base import BaseConfig
 
 @dataclass
-class MiniMaxConfig(BaseConfig):
+class DeepSeekV2MiniConfig(BaseConfig): # these arent right 
     # MoE
     ffw_hidden_size: int = 9216
     num_experts: int = 32
@@ -25,8 +25,8 @@ class MiniMaxConfig(BaseConfig):
     compressed_dim_kv: Optional[int] = None
     compressed_dim_q: Optional[int] = None
     rope_head_dim: Optional[int] = None
-
+    
     rms_norm_epsilon: float = 1e-6
     
-    vocab_size=32000,
-    max_seq_len=1024,
+    vocab_size: int = 32000,
+    max_seq_len: int = 1024,
