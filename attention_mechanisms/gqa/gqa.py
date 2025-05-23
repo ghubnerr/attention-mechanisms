@@ -16,6 +16,7 @@ from ..utils.rope import RotaryPositionEmbedding
 from ..utils import xavier_uniform
 import jax
 
+
 class GQAAttention(nn.Module):
     """
     Implements standard scaled dot-product attention with an optional
@@ -36,22 +37,30 @@ class GQAAttention(nn.Module):
 
         # Precomputed scaling factor for efficiency
         self.scale = 1.0 / jnp.sqrt(self.head_dim)
-        
+
         self.rope = RotaryPositionEmbedding(config=self.config)
 
         self.q_proj = nn.Dense(features=self.num_heads * self.head_dim,
-                               kernel_init=xavier_uniform, name="q_proj")
+                               kernel_init=xavier_uniform, name="q_proj",
+                               dtype=self.config.dtype,
+                               param_dtype=self.config.param_dtype)
         self.k_proj = nn.Dense(features=self.num_kv_heads * self.head_dim,
-                               kernel_init=xavier_uniform, name="k_proj")
+                               kernel_init=xavier_uniform, name="k_proj",
+                               dtype=self.config.dtype,
+                               param_dtype=self.config.param_dtype)
         self.v_proj = nn.Dense(features=self.num_kv_heads * self.head_dim,
-                               kernel_init=xavier_uniform, name="v_proj")
+                               kernel_init=xavier_uniform, name="v_proj",
+                               dtype=self.config.dtype,
+                               param_dtype=self.config.param_dtype)
         self.out_proj = nn.Dense(features=self.hidden_size,
-                                 kernel_init=xavier_uniform, name="out_proj")
+                                 kernel_init=xavier_uniform, name="out_proj",
+                                 dtype=self.config.dtype,
+                                 param_dtype=self.config.param_dtype)
 
     def __call__(self,
                  hidden_states: Float[Array, "batch seq_len hidden_size"],
                  mask: Optional[Float[Array, "batch 1 seq_len seq_len"]] = None
-                ) -> Float[Array, "batch seq_len hidden_size"]:
+                 ) -> Float[Array, "batch seq_len hidden_size"]:
         """
         Forward pass of the softmax attention mechanism.
 
@@ -93,7 +102,7 @@ class GQAAttention(nn.Module):
         if self.group_size > 1:
             k = jnp.repeat(k, self.group_size, axis=1)  # (b, 64, s, 128)
             v = jnp.repeat(v, self.group_size, axis=1)  # (b, 64, s, 128)
-        
+
         attn_scores = jax.lax.dot_general(
             q, k,
             dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1)))
@@ -103,23 +112,24 @@ class GQAAttention(nn.Module):
             mask = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len))
             mask = jnp.repeat(mask, self.num_heads, axis=1)
             attn_scores += mask * -1e9
-            
-        attn_probs = nn.softmax(attn_scores, axis=-1)
+
+        attn_probs = nn.softmax(attn_scores, axis=-1).astype(jnp.float32)
 
         attn_output = jax.lax.dot_general(
             attn_probs, v,
             dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1)))
         )  # (b, 64, s, 128)
-        
+
         # Reshape the attention output back to the original format
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        
+        attn_output = attn_output.transpose(
+            0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+
         return self.out_proj(attn_output)
-    
-    
+
+
 class AutoRegGQAAttention(nn.Module):
     config: BaseConfig
-    
+
     """
     Implements standard auto-regressive scaled dot-product attention with an optional
     Grouped Query Attention (GQA) mechanism using repeated keys and values.
@@ -137,25 +147,39 @@ class AutoRegGQAAttention(nn.Module):
 
         self.rope = RotaryPositionEmbedding(config=self.config)
 
-        self.q_proj = nn.Dense(self.num_heads * self.head_dim, kernel_init=xavier_uniform, name="q_proj")
-        self.k_proj = nn.Dense(self.num_kv_heads * self.head_dim, kernel_init=xavier_uniform, name="k_proj")
-        self.v_proj = nn.Dense(self.num_kv_heads * self.head_dim, kernel_init=xavier_uniform, name="v_proj")
-        self.out_proj = nn.Dense(self.hidden_size, kernel_init=xavier_uniform, name="out_proj")
+        self.q_proj = nn.Dense(
+            self.num_heads * self.head_dim, kernel_init=xavier_uniform, name="q_proj",
+            dtype=self.config.dtype,
+            param_dtype=self.config.param_dtype)
+        self.k_proj = nn.Dense(
+            self.num_kv_heads * self.head_dim, kernel_init=xavier_uniform, name="k_proj",
+            dtype=self.config.dtype,
+            param_dtype=self.config.param_dtype)
+        self.v_proj = nn.Dense(
+            self.num_kv_heads * self.head_dim, kernel_init=xavier_uniform, name="v_proj",
+            dtype=self.config.dtype,
+            param_dtype=self.config.param_dtype)
+        self.out_proj = nn.Dense(
+            self.hidden_size, kernel_init=xavier_uniform, name="out_proj",
+            dtype=self.config.dtype,
+            param_dtype=self.config.param_dtype)
 
     def __call__(self,
                  hidden_states: Float[Array, "batch seq_len hidden_size"],
-                 past_key: Optional[Float[Array, "batch num_heads past_len head_dim"]] = None,
-                 past_value: Optional[Float[Array, "batch num_heads past_len head_dim"]] = None,
+                 past_key: Optional[Float[Array,
+                                          "batch num_heads past_len head_dim"]] = None,
+                 past_value: Optional[Float[Array,
+                                            "batch num_heads past_len head_dim"]] = None,
                  mask: Optional[Float[Array, "batch 1 seq_len seq_len"]] = None) -> Tuple[Float[Array, "batch seq_len hidden_size"], Float[Array, "batch num_heads seq_len head_dim"], Float[Array, "batch num_heads seq_len head_dim"]]:
         """
         Forward pass for AutoRegGQAAttention.
-        
+
         Args:
             hidden_states (Float[Array, "batch seq_len hidden_size"]): The input hidden states of shape (batch, seq_len, hidden_size).
             past_key (Optional[Float[Array, "batch num_heads past_len head_dim"]]): The cached keys from previous steps. Defaults to None.
             past_value (Optional[Float[Array, "batch num_heads past_len head_dim"]]): The cached values from previous steps. Defaults to None.
             mask (Optional[Float[Array, "batch 1 seq_len seq_len"]]): The attention mask to prevent attending to future tokens. Defaults to None.
-        
+
         Returns:
             Tuple[Float[Array, "batch seq_len hidden_size"], Float[Array, "batch num_heads seq_len head_dim"], Float[Array, "batch num_heads seq_len head_dim"]]:
                 - attn_output: The attention-processed output of shape (batch, seq_len, hidden_size).
@@ -190,7 +214,8 @@ class AutoRegGQAAttention(nn.Module):
             k = jnp.repeat(k, self.group_size, axis=1)
             v = jnp.repeat(v, self.group_size, axis=1)
 
-        attn_scores = jax.lax.dot_general(q, k, dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1)))) * self.scale
+        attn_scores = jax.lax.dot_general(q, k, dimension_numbers=(
+            ((3,), (3,)), ((0, 1), (0, 1)))) * self.scale
 
         if mask is not None:
             seq_len_k = k.shape[2]
@@ -198,11 +223,13 @@ class AutoRegGQAAttention(nn.Module):
             mask = jnp.repeat(mask, self.num_heads, axis=1)
             attn_scores += mask * -1e9
 
-        attn_probs = nn.softmax(attn_scores, axis=-1)
+        attn_probs = nn.softmax(attn_scores, axis=-1).astype(jnp.float32)
 
-        attn_output = jax.lax.dot_general(attn_probs, v, dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))))
+        attn_output = jax.lax.dot_general(
+            attn_probs, v, dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))))
 
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        attn_output = attn_output.transpose(
+            0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         attn_output = self.out_proj(attn_output)
 
         return attn_output, new_past_key, new_past_value

@@ -1,3 +1,4 @@
+from functools import partial
 from flax import linen as nn
 import jax.numpy as jnp
 from jaxtyping import Float, Array
@@ -6,6 +7,7 @@ from ..configs import BaseConfig
 from ..utils.rope import RotaryPositionEmbedding
 from ..utils import xavier_uniform
 import jax
+
 
 class MLAttention(nn.Module):
     """
@@ -40,44 +42,61 @@ class MLAttention(nn.Module):
         self.config.compressed_dim_q = self.config.compressed_dim_q
         self.config.rope_head_dim = self.config.rope_head_dim
         self.rope = RotaryPositionEmbedding(config=self.config)
-        self.scale = 1.0 / jnp.sqrt(self.config.head_dim + self.config.rope_head_dim)
+        self.scale = 1.0 / \
+            jnp.sqrt(self.config.head_dim + self.config.rope_head_dim)
 
         # W_DKV: (compressed_dim_kv, hidden_size)
         self.W_DKV = nn.Dense(self.config.compressed_dim_kv, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_DKV")
+                              kernel_init=xavier_uniform, name="W_DKV",
+                              dtype=self.config.dtype,
+                              param_dtype=self.config.param_dtype)
 
         # W_UK:  (num_heads*head_dim, compressed_dim_kv)
         self.W_UK = nn.Dense(self.config.head_dim * self.config.num_heads, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_UK")
+                             kernel_init=xavier_uniform, name="W_UK",
+                             dtype=self.config.dtype,
+                             param_dtype=self.config.param_dtype)
 
         # W_UV:  (num_heads*head_dim, compressed_dim_kv)
         self.W_UV = nn.Dense(self.config.head_dim * self.config.num_heads, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_UV")
+                             kernel_init=xavier_uniform, name="W_UV",
+                             dtype=self.config.dtype,
+                             param_dtype=self.config.param_dtype)
 
         # W_DQ: (compressed_dim_q, seq_len)
         self.W_DQ = nn.Dense(self.config.compressed_dim_q, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_DQ")
+                             kernel_init=xavier_uniform, name="W_DQ",
+                             dtype=self.config.dtype,
+                             param_dtype=self.config.param_dtype)
 
         # W_UQ: (num_heads*head_dim, seq_len)
         self.W_UQ = nn.Dense(self.config.head_dim * self.config.num_heads, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_UQ")
+                             kernel_init=xavier_uniform, name="W_UQ",
+                             dtype=self.config.dtype,
+                             param_dtype=self.config.param_dtype)
 
         # W_QR: (num_heads * rope_head_dim, compressed_dim_q)
         self.W_QR = nn.Dense(self.config.num_heads * self.config.rope_head_dim, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_QR")
+                             kernel_init=xavier_uniform, name="W_QR",
+                             dtype=self.config.dtype,
+                             param_dtype=self.config.param_dtype)
 
         # W_KR: (rope_head_dim, seq_len)
         self.W_KR = nn.Dense(self.config.rope_head_dim, use_bias=False,
-                              kernel_init=xavier_uniform, name="W_KR")
+                             kernel_init=xavier_uniform, name="W_KR",
+                             dtype=self.config.dtype,
+                             param_dtype=self.config.param_dtype)
 
         # W_O: (hidden_size, num_heads * head_dim)
         self.W_O = nn.Dense(self.config.hidden_size, use_bias=False,
-                            kernel_init=xavier_uniform, name="W_O")
+                            kernel_init=xavier_uniform, name="W_O",
+                            dtype=self.config.dtype,
+                            param_dtype=self.config.param_dtype)
 
     def __call__(self,
-                hidden_states: Float[Array, "batch seq_len hidden_size"],
-                mask: Optional[Float[Array, "batch 1 seq_len seq_len"]] = None
-            ) -> Float[Array, "batch seq_len hidden_size"]:
+                 hidden_states: Float[Array, "batch seq_len hidden_size"],
+                 mask: Optional[Float[Array, "batch 1 seq_len seq_len"]] = None
+                 ) -> Float[Array, "batch seq_len hidden_size"]:
         """
         Applies the MLA mechanism to the input hidden states.
 
@@ -103,40 +122,49 @@ class MLAttention(nn.Module):
         c_Q = self.W_DQ(hidden_states)
         q_C = self.W_UQ(c_Q)
 
-        q_R = self.W_QR(c_Q).reshape(batch_size, seq_len, self.config.num_heads, self.config.rope_head_dim)
-        k_R = self.W_KR(hidden_states).reshape(batch_size, seq_len, 1, self.config.rope_head_dim)
+        q_R = self.W_QR(c_Q).reshape(batch_size, seq_len,
+                                     self.config.num_heads, self.config.rope_head_dim)
+        k_R = self.W_KR(hidden_states).reshape(
+            batch_size, seq_len, 1, self.config.rope_head_dim)
 
         q_R, k_R = self.rope(q_R, k_R)
-        k_R = jnp.broadcast_to(k_R, (batch_size, seq_len, self.config.num_heads, self.config.rope_head_dim))
+        k_R = jnp.broadcast_to(
+            k_R, (batch_size, seq_len, self.config.num_heads, self.config.rope_head_dim))
 
-        q_C = q_C.reshape(batch_size, seq_len, self.config.num_heads, self.config.head_dim)
-        k_C = k_C.reshape(batch_size, seq_len, self.config.num_heads, self.config.head_dim)
+        q_C = q_C.reshape(batch_size, seq_len,
+                          self.config.num_heads, self.config.head_dim)
+        k_C = k_C.reshape(batch_size, seq_len,
+                          self.config.num_heads, self.config.head_dim)
 
         q = jnp.concatenate([q_C, q_R], axis=-1)
         k = jnp.concatenate([k_C, k_R], axis=-1)
 
-        v = v_C.reshape(batch_size, seq_len, self.config.num_heads, self.config.head_dim)
+        v = v_C.reshape(batch_size, seq_len,
+                        self.config.num_heads, self.config.head_dim)
 
         q = jnp.transpose(q, (0, 2, 1, 3))
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
 
         attn_scores = jax.lax.dot_general(q, k,
-            dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1)))) * self.scale
+                                          dimension_numbers=(((3,), (3,)), ((0, 1), (0, 1)))) * self.scale
 
         if mask is not None:
             seq_len_total = k.shape[2]
-            mask = jnp.broadcast_to(mask, (batch_size, 1, seq_len, seq_len_total))
+            mask = jnp.broadcast_to(
+                mask, (batch_size, 1, seq_len, seq_len_total))
             mask = jnp.repeat(mask, self.config.num_heads, axis=1)
             attn_scores += mask * -1e9
 
-        attn_probs = nn.softmax(attn_scores, axis=-1)
+        attn_probs = nn.softmax(attn_scores, axis=-1).astype(jnp.float32)
 
         attn_output = jax.lax.dot_general(attn_probs, v,
-            dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))))
+                                          dimension_numbers=(((3,), (2,)), ((0, 1), (0, 1))))
 
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        attn_output = attn_output.reshape(batch_size, seq_len, self.config.num_heads * self.config.head_dim)
+        attn_output = attn_output.transpose(
+            0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        attn_output = attn_output.reshape(
+            batch_size, seq_len, self.config.num_heads * self.config.head_dim)
 
         return self.W_O(attn_output)
 
@@ -164,6 +192,9 @@ class AutoRegMLAttention(nn.Module):
     """
     config: BaseConfig
 
+    def _w_init(dtype):          # helper to reduce boilerplate
+        return partial(nn.initializers.xavier_uniform(), dtype=dtype)
+
     def setup(self):
         """
         Initializes the model parameters using Xavier uniform initialization.
@@ -180,12 +211,12 @@ class AutoRegMLAttention(nn.Module):
         - rope: Rotary Position Embedding module (partial or full).
         """
         # 1) Low-rank (down) projection for queries and for KV
-        self.W_DQ   = self.param(
-            "W_DQ", nn.initializers.xavier_uniform(),
+        self.W_DQ = self.param(
+            "W_DQ", self._w_init(self.config.dtype),
             (self.config.hidden_size, self.config.compressed_dim_q)
         )
-        self.W_DKV  = self.param(
-            "W_DKV", nn.initializers.xavier_uniform(),
+        self.W_DKV = self.param(
+            "W_DKV", self._w_init(self.config.dtype),
             (self.config.hidden_size, self.config.compressed_dim_kv)
         )
 
@@ -193,31 +224,35 @@ class AutoRegMLAttention(nn.Module):
         #    shape => (compressed_dim_q, num_heads*head_dim) or
         #              (compressed_dim_q, num_heads*rope_head_dim)
         self.W_UQ_C = self.param(
-            "W_UQ_C", nn.initializers.xavier_uniform(),
-            (self.config.compressed_dim_q, self.config.num_heads * self.config.head_dim)
+            "W_UQ_C",  self._w_init(self.config.dtype),
+            (self.config.compressed_dim_q,
+             self.config.num_heads * self.config.head_dim)
         )
         self.W_UQ_R = self.param(
-            "W_UQ_R", nn.initializers.xavier_uniform(),
-            (self.config.compressed_dim_q, self.config.num_heads * self.config.rope_head_dim)
+            "W_UQ_R", self._w_init(self.config.dtype),
+            (self.config.compressed_dim_q,
+             self.config.num_heads * self.config.rope_head_dim)
         )
 
-        self.W_KR   = self.param(
-            "W_KR", nn.initializers.xavier_uniform(),
+        self.W_KR = self.param(
+            "W_KR", self._w_init(self.config.dtype),
             (self.config.hidden_size, self.config.rope_head_dim)
         )
 
         # 4) Up-projection for compressed KV => used by the "absorption trick."
         self.W_UK_C = self.param(
-            "W_UK_C", nn.initializers.xavier_uniform(),
-            (self.config.compressed_dim_kv, self.config.num_heads * self.config.head_dim)
+            "W_UK_C", self._w_init(self.config.dtype),
+            (self.config.compressed_dim_kv,
+             self.config.num_heads * self.config.head_dim)
         )
         self.W_UV_C = self.param(
-            "W_UV_C", nn.initializers.xavier_uniform(),
-            (self.config.compressed_dim_kv, self.config.num_heads * self.config.head_dim)
+            "W_UV_C", self._w_init(self.config.dtype),
+            (self.config.compressed_dim_kv,
+             self.config.num_heads * self.config.head_dim)
         )
 
-        self.W_O    = self.param(
-            "W_O", nn.initializers.xavier_uniform(),
+        self.W_O = self.param(
+            "W_O", self._w_init(self.config.dtype),
             (self.config.num_heads * self.config.head_dim, self.config.hidden_size)
         )
 
@@ -227,8 +262,10 @@ class AutoRegMLAttention(nn.Module):
         self,
         hidden_states: Float[Array, "batch seq_len hidden_size"],
         mask: Optional[Float[Array, "batch 1 seq_len seq_len"]] = None,
-        cached_cKV: Optional[Float[Array, "batch prefix_len compressed_dim_kv"]] = None,
-        cached_kR: Optional[Float[Array, "batch prefix_len rope_head_dim"]] = None
+        cached_cKV: Optional[Float[Array,
+                                   "batch prefix_len compressed_dim_kv"]] = None,
+        cached_kR: Optional[Float[Array,
+                                  "batch prefix_len rope_head_dim"]] = None
     ) -> Tuple[
         Float[Array, "batch seq_len hidden_size"],
         Float[Array, "batch prefix_len compressed_dim_kv"],
@@ -255,7 +292,8 @@ class AutoRegMLAttention(nn.Module):
         head_dim = self.config.head_dim
 
         if cached_cKV is None:
-            cached_cKV = jnp.zeros((B, 0, self.config.compressed_dim_kv), dtype=hidden_states.dtype)
+            cached_cKV = jnp.zeros(
+                (B, 0, self.config.compressed_dim_kv), dtype=hidden_states.dtype)
         if cached_kR is None:
             cached_kR = jnp.zeros((B, 0, rH), dtype=hidden_states.dtype)
         prefix_len = cached_cKV.shape[1]
@@ -265,56 +303,65 @@ class AutoRegMLAttention(nn.Module):
         cKV_t = jnp.einsum('bsh,hv->bsv', hidden_states, self.W_DKV)
 
         # Compute per-head queries (contextual and RoPE parts)
-        qC_t = jnp.einsum('bsq,qc->bsc', cQ_t, self.W_UQ_C).reshape(B, seq_len, nH, head_dim)
-        qR_t = jnp.einsum('bsq,qr->bsr', cQ_t, self.W_UQ_R).reshape(B, seq_len, nH, rH)
+        qC_t = jnp.einsum('bsq,qc->bsc', cQ_t,
+                          self.W_UQ_C).reshape(B, seq_len, nH, head_dim)
+        qR_t = jnp.einsum('bsq,qr->bsr', cQ_t,
+                          self.W_UQ_R).reshape(B, seq_len, nH, rH)
 
         # Compute RoPE key (same as before)
-        kR_t = jnp.einsum('bsh,hr->bsr', hidden_states, self.W_KR).reshape(B, seq_len, 1, rH)
+        kR_t = jnp.einsum('bsh,hr->bsr', hidden_states,
+                          self.W_KR).reshape(B, seq_len, 1, rH)
         qR_t, kR_t = self.rope(qR_t, kR_t)
         kR_t_broadcasted = jnp.broadcast_to(kR_t, (B, seq_len, nH, rH))
-        
+
         # Absorption trick: instead of computing k_C = W_UK * cKV for each token,
         # we compute q_eff = q_C * W_UK^T for the current token
         W_UK_C_T = jnp.transpose(self.W_UK_C, (1, 0))
         W_UK_C_reshaped = W_UK_C_T.reshape(nH, head_dim, -1)
-        
 
         qC_per_head = qC_t
-        
+
         qC_eff = jnp.einsum('bsnh,nhk->bsnk', qC_per_head, W_UK_C_reshaped)
-        
+
         if prefix_len > 0:
             # Compute contextual score component per head
             score_Cprefix = jnp.einsum('bsnk,bLk->bsnL', qC_eff, cached_cKV)
-            
+
             # Compute RoPE score component per head
-            cached_kR_expanded = jnp.repeat(cached_kR, 1, axis=2).reshape(B, prefix_len, 1, rH)
-            cached_kR_broadcasted = jnp.broadcast_to(cached_kR_expanded, (B, prefix_len, nH, rH))
-            score_Rprefix = jnp.einsum('bsnr,bLnr->bsnL', qR_t, cached_kR_broadcasted)
-            
+            cached_kR_expanded = jnp.repeat(
+                cached_kR, 1, axis=2).reshape(B, prefix_len, 1, rH)
+            cached_kR_broadcasted = jnp.broadcast_to(
+                cached_kR_expanded, (B, prefix_len, nH, rH))
+            score_Rprefix = jnp.einsum(
+                'bsnr,bLnr->bsnL', qR_t, cached_kR_broadcasted)
+
             # Combine score components
             score_prefix = score_Cprefix + score_Rprefix
         else:
-            score_prefix = jnp.zeros((B, seq_len, nH, 0), dtype=hidden_states.dtype)
-        
+            score_prefix = jnp.zeros(
+                (B, seq_len, nH, 0), dtype=hidden_states.dtype)
+
         # Compute score for the new token (per head)
-        new_token_score_C = jnp.einsum('bsnk,bsk->bsn', qC_eff, cKV_t)[..., None]
-        new_token_score_R = jnp.einsum('bsnr,bsnr->bsn', qR_t, kR_t_broadcasted)[..., None]
+        new_token_score_C = jnp.einsum(
+            'bsnk,bsk->bsn', qC_eff, cKV_t)[..., None]
+        new_token_score_R = jnp.einsum(
+            'bsnr,bsnr->bsn', qR_t, kR_t_broadcasted)[..., None]
         new_token_score = new_token_score_C + new_token_score_R
-        
+
         # Concatenate prefix and new token scores
         scores = jnp.concatenate([score_prefix, new_token_score], axis=-1)
-        
+
         # Scale and mask
         scores = scores * (1.0 / jnp.sqrt(head_dim + rH))
         if mask is not None:
             # Expand mask for all heads
-            expanded_mask = jnp.broadcast_to(mask, (B, nH, seq_len, mask.shape[-1]))
+            expanded_mask = jnp.broadcast_to(
+                mask, (B, nH, seq_len, mask.shape[-1]))
             scores = scores + expanded_mask * -1e9
-        
+
         # Apply softmax per head
-        attn_probs = nn.softmax(scores, axis=-1)
-        
+        attn_probs = nn.softmax(scores, axis=-1).astype(jnp.float32)
+
         # Value computation with absorption trick
         # Reshape W_UV_C to per-head format for the absorption trick
         W_UV_C_reshaped = self.W_UV_C.reshape(-1, nH, head_dim)
@@ -322,8 +369,10 @@ class AutoRegMLAttention(nn.Module):
 
         if prefix_len > 0:
             # Process prefix context
-            prefix_values = jnp.einsum('bLk,knh->bLnh', cached_cKV, W_UV_C_reshaped)
-            prefix_agg = jnp.einsum('bsnL,bLnh->bsnh', attn_probs[..., :-1], prefix_values)
+            prefix_values = jnp.einsum(
+                'bLk,knh->bLnh', cached_cKV, W_UV_C_reshaped)
+            prefix_agg = jnp.einsum(
+                'bsnL,bLnh->bsnh', attn_probs[..., :-1], prefix_values)
         else:
             prefix_agg = 0.0
 
@@ -332,11 +381,9 @@ class AutoRegMLAttention(nn.Module):
 
         attn_output = prefix_agg + new_agg
 
-
         output = jnp.einsum('bsnh,nhc->bsc', attn_output, W_O_reshaped)
-        
 
         new_cached_cKV = jnp.concatenate([cached_cKV, cKV_t], axis=1)
         new_cached_kR = jnp.concatenate([cached_kR, kR_t[:, :, 0, :]], axis=1)
-        
+
         return output, new_cached_cKV, new_cached_kR
